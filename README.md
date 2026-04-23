@@ -111,9 +111,7 @@ GPU_ENABLED = False                   # 是否启用 GPU 加速（需安装 padd
 
 ```
 .
-├── invoice_extract_uiex.py   # 主程序脚本
-├── invoices/                 # 存放发票的文件夹（示例）
-├── 发票识别结果_UIEX.xlsx     # 输出结果文件
+├── OCR_to_excel.py   # 主程序脚本
 ├── requirements.txt          # 依赖列表
 └── README.md                 # 项目说明文档
 ```
