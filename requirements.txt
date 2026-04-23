@@ -1,0 +1,1 @@
+pip install paddlepaddle paddlenlp paddleocr openpyxl pandas pillow
