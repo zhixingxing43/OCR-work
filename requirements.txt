@@ -1,1 +1,7 @@
-pip install paddlepaddle paddlenlp paddleocr openpyxl pandas pillow
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+paddlenlp>=2.6.0
+openpyxl>=3.1.0
+pandas>=2.0.0
+Pillow>=9.5.0
+
