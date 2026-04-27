@@ -1,261 +1,271 @@
 """
-基于 PaddleOCR + UIE-X 的发票关键信息抽取工具
-功能：批量识别发票图片/PDF，提取发票头关键字段，输出 Excel
-作者：财务智能化工具
-版本：2.0 (UIE-X 高精度版)
+============================================================
+发票 & 合同 OCR 识别工具
+环境：PaddleOCR 2.9.1 + PyMuPDF + OpenCV + pandas + openpyxl
+功能：
+    - 批量处理指定文件夹中的所有图片/PDF
+    - 提取发票关键字段（号码、代码、日期、金额等）
+    - 合同等非发票文件保存全文识别文本
+    - 导出 Excel 表格
+使用方法：
+    1. 安装依赖：pip install -r requirements.txt
+    2. 修改 INPUT_DIR 为你的图片目录
+    3. 运行：python invoice_ocr.py
+============================================================
 """
+import os
+os.environ['FLAGS_use_mkldnn'] = '0'   # 禁用 oneDNN，强制使用原生 CPU 推理
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # 避免 OpenMP 冲突（Windows 常见）
 
 import os
 import re
-import json
+import cv2
+import numpy as np
 import pandas as pd
-from PIL import Image
 from paddleocr import PaddleOCR
-from paddlenlp import Taskflow
+from PIL import Image
+from collections import defaultdict
 
-# ================== 配置区域（请根据实际情况修改） ==================
-IMAGE_FOLDER = "./invoices"          # 存放发票图片/PDF的文件夹路径
-OUTPUT_EXCEL = "./发票识别结果_UIEX.xlsx"  # 输出 Excel 文件路径
-GPU_ENABLED = False                  # 是否使用 GPU 加速（需安装 paddlepaddle-gpu）
-OCR_USE_ANGLE_CLS = True             # OCR 方向校正
-OCR_LANG = 'ch'                      # 识别语言
-# ===================================================================
+# ==================== 配置 ====================
+INPUT_DIR = r"D:\A\Agent-renting\demo"          # 发票/合同图片所在目录
+OUTPUT_EXCEL = "output/invoices.xlsx"           # 输出 Excel 路径
+SUPPORTED_IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")
+SUPPORTED_PDF_EXTS = (".pdf",)
 
-# 支持的图片格式
-SUPPORTED_EXT = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.pdf')
-
-# UIE-X 信息抽取的 Schema 定义（发票关键字段）
-# 使用 UIE-X 的跨模态文档抽取能力，通过自然语言描述字段即可
-SCHEMA = [
-    '发票代码',
-    '发票号码',
-    '开票日期',
-    '校验码',
-    '价税合计',
-    '购买方名称',
-    '购买方纳税人识别号',
-    '销售方名称',
-    '销售方纳税人识别号'
-]
-
-# 字段名称映射（用于统一输出列名）
-FIELD_MAP = {
-    '发票代码': '发票代码',
-    '发票号码': '发票号码',
-    '开票日期': '开票日期',
-    '校验码': '校验码',
-    '价税合计': '价税合计(小写)',
-    '购买方名称': '购买方名称',
-    '购买方纳税人识别号': '购买方税号',
-    '销售方名称': '销售方名称',
-    '销售方纳税人识别号': '销售方税号'
+# 发票关键字段关键词映射（可自定义扩展）
+INVOICE_KEYWORDS = {
+    "发票号码": ["发票号码", "No.", "号码"],
+    "发票代码": ["发票代码", "Code"],
+    "开票日期": ["开票日期", "日期"],
+    "校验码": ["校验码", "验证码"],
+    "购买方名称": ["购买方名称", "购货方", "名称（购买方）"],
+    "购买方识别号": ["购买方纳税人识别号", "纳税人识别号（购）"],
+    "销售方名称": ["销售方名称", "销货方", "名称（销售方）"],
+    "销售方识别号": ["销售方纳税人识别号", "纳税人识别号（销）"],
+    "合计金额": ["合计金额", "金额（小写）", "小写金额"],
+    "合计税额": ["合计税额", "税额（小写）"],
+    "价税合计": ["价税合计", "价税合计（大写）", "合计（大写）"],
+    "备注": ["备注"],
 }
 
-# 可选：补充大写金额字段（UIE-X 不一定直接输出，通过 OCR 文本正则补充）
-EXTRA_FIELDS = ['价税合计(大写)']
+# ==================== 工具函数 ====================
+def enhance_image(img: np.ndarray) -> np.ndarray:
+    """
+    CLAHE 对比度增强（保留颜色）
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
-def init_ocr():
-    """
-    初始化 PaddleOCR 引擎（用于获取纯文本行，辅助 UIE-X 抽取不足的字段）
-    """
-    return PaddleOCR(
-        use_angle_cls=OCR_USE_ANGLE_CLS,
-        lang=OCR_LANG,
-        show_log=False,
-        use_gpu=GPU_ENABLED
-    )
 
 
-def init_uie_x():
+def get_bbox_xyxy(box: list) -> tuple:
     """
-    初始化 UIE-X 文档信息抽取模型（基于多模态跨模态架构）
-    首次运行会自动下载约 2GB 模型文件
+    将四点坐标转换为 (xmin, ymin, xmax, ymax)
+    box: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
     """
-    print("正在加载 UIE-X 模型（首次运行需下载约 2GB 模型，请耐心等待）...")
-    ie = Taskflow(
-        'information_extraction',
-        schema=SCHEMA,
-        model='uie-x-base',
-        task_path=None,               # 使用官方预训练模型
-        device_id=0 if GPU_ENABLED else -1  # -1 表示 CPU
-    )
-    print("UIE-X 模型加载完成！")
-    return ie
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
+    return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
 
-def extract_with_uiex(ie, image_path):
-    """
-    使用 UIE-X 直接对文档图像进行关键信息抽取
-    返回字典，键为字段名，值为识别结果（列表形式）
-    """
-    try:
-        # UIE-X 支持直接传入图片路径
-        result = ie({'doc': image_path})
-        return result
-    except Exception as e:
-        print(f"    UIE-X 抽取出错: {e}")
-        return {}
+def compute_center(box: tuple) -> tuple:
+    xmin, ymin, xmax, ymax = box
+    return (xmin + xmax) / 2, (ymin + ymax) / 2
 
 
-def extract_full_text(ocr_engine, image_path):
+def group_lines(ocr_results: list, y_tol: int = 10) -> list:
     """
-    使用 PaddleOCR 获取全部文本行（用于正则提取大写金额等补充字段）
-    返回拼接后的全文和行列表
+    将 OCR 结果按行分组（y 坐标接近的视为同一行）
+    返回二维列表，每个子列表为同一行的 OCR 条目，按 x 坐标排序
     """
-    try:
-        result = ocr_engine.ocr(image_path, cls=OCR_USE_ANGLE_CLS)
-        if not result or not result[0]:
-            return '', []
-        lines = [line[1][0] for line in result[0]]
-        full_text = ''.join(lines)
-        return full_text, lines
-    except Exception as e:
-        print(f"    OCR 文本提取出错: {e}")
-        return '', []
-
-
-def parse_uiex_result(uiex_result, full_text=''):
-    """
-    将 UIE-X 返回的嵌套结构转换为扁平的字段字典
-    UIE-X 返回格式示例：
-    {
-      '发票代码': [{'text': '123456789012', 'probability': 0.98, ...}],
-      ...
-    }
-    """
-    fields = {}
-    for key in SCHEMA:
-        value_list = uiex_result.get(key, [])
-        if value_list:
-            # 取置信度最高的一项
-            best_item = max(value_list, key=lambda x: x.get('probability', 0))
-            fields[FIELD_MAP.get(key, key)] = best_item.get('text', '').strip()
+    if not ocr_results:
+        return []
+    # 按 y 中心排序
+    sorted_results = sorted(ocr_results, key=lambda x: (compute_center(get_bbox_xyxy(x[0]))[1], compute_center(get_bbox_xyxy(x[0]))[0]))
+    lines = []
+    current_line = [sorted_results[0]]
+    _, y_center_prev = compute_center(get_bbox_xyxy(sorted_results[0][0]))
+    for item in sorted_results[1:]:
+        _, y_center = compute_center(get_bbox_xyxy(item[0]))
+        if abs(y_center - y_center_prev) <= y_tol:
+            current_line.append(item)
         else:
-            fields[FIELD_MAP.get(key, key)] = ''
+            lines.append(sorted(current_line, key=lambda x: compute_center(get_bbox_xyxy(x[0]))[0]))
+            current_line = [item]
+        y_center_prev = y_center
+    lines.append(sorted(current_line, key=lambda x: compute_center(get_bbox_xyxy(x[0]))[0]))
+    return lines
 
-    # 补充大写金额（UIE-X 可能未定义，从 OCR 全文正则提取）
-    capital_amount = extract_capital_amount(full_text)
-    fields['价税合计(大写)'] = capital_amount
 
-    # 补充校验码（部分发票版式 UIE-X 可能漏掉，用正则兜底）
-    if not fields.get('校验码'):
-        fields['校验码'] = extract_check_code(full_text)
+def find_value_by_keyword(keyword: str, lines: list) -> str:
+    """
+    在按行分组的 OCR 结果中查找 keyword，然后获取其右侧或下一行的值
+    """
+    # 扁平化所有文本项，以便按坐标查找
+    all_items = [(get_bbox_xyxy(item[0]), item[1][0]) for line in lines for item in line]
+    for idx, (bbox, text) in enumerate(all_items):
+        # 匹配关键词
+        if any(kw in text for kw in [keyword]):  # 只匹配传入的具体关键词
+            # 1. 尝试同行右侧文本
+            for bbox2, text2 in all_items:
+                if bbox2[0] > bbox[2] and abs(bbox[1] - bbox2[1]) <= 10:  # 右侧相邻
+                    # 取最近的一个
+                    dist = bbox2[0] - bbox[2]
+                    if dist < 200:  # 避免跨太远
+                        return re.sub(r'[：: ]', '', text2).replace(keyword, '').strip()
+            # 2. 尝试下一行
+            for line in lines:
+                line_center_y = np.mean([compute_center(get_bbox_xyxy(item[0]))[1] for item in line])
+                if abs(line_center_y - (bbox[1]+bbox[3])/2) <= 15:  # 下一行
+                    for item in line:
+                        bbox2, text2 = get_bbox_xyxy(item[0]), item[1][0]
+                        if bbox2[0] >= bbox[0] - 50:  # 大致同列
+                            return re.sub(r'[：: ]', '', text2).strip()
+    return ""
 
+
+def extract_invoice_fields(ocr_results: list) -> dict:
+    """
+    从 OCR 结果中提取发票关键字段
+    """
+    lines = group_lines(ocr_results, y_tol=12)
+    fields = {}
+    # 先扁平化所有文本，供某些需要区分的字段使用（如购买方 vs 销售方）
+    all_texts = [item[1][0] for line in lines for item in line]
+
+    for field_en, keywords in INVOICE_KEYWORDS.items():
+        value = ""
+        for kw in keywords:
+            value = find_value_by_keyword(kw, lines)
+            if value:
+                break
+        # 特殊处理：购买方/销售方名称可能以“名称：”单独出现，需要结合上下文
+        if field_en == "购买方名称" and not value:
+            # 搜索“名称”但排除“销售方”区域
+            for line in lines:
+                for item in line:
+                    bbox, text = get_bbox_xyxy(item[0]), item[1][0]
+                    if "名称" in text and "销售" not in text:
+                        # 尝试取其右侧或下一行
+                        value = find_value_by_keyword("名称", lines)
+                        if value:
+                            break
+        fields[field_en] = value
+
+    # 如果未提取到核心字段，可能不是发票，返回 None
+    if not fields["发票号码"] and not fields["发票代码"]:
+        return None  # 大概率是合同
     return fields
 
 
-def extract_capital_amount(full_text):
+def recognize_image(image) -> list:
     """
-    从文本中提取中文大写金额
+    对 PIL Image 或 numpy array 进行 OCR，返回标准的 ocr 结果列表
     """
-    patterns = [
-        r'[（(]大写[）)][：:\s]*([壹贰叁肆伍陆柒捌玖拾佰仟万亿元角分整零]+)',
-        r'价税合计.*?大写.*?[：:\s]*([壹贰叁肆伍陆柒捌玖拾佰仟万亿元角分整零]+)',
-        r'人民币.*?大写.*?[：:\s]*([壹贰叁肆伍陆柒捌玖拾佰仟万亿元角分整零]+)',
-        r'金额大写[：:\s]*([壹贰叁肆伍陆柒捌玖拾佰仟万亿元角分整零]+)'
-    ]
-    for pat in patterns:
-        match = re.search(pat, full_text)
-        if match:
-            return match.group(1).strip()
-    return ''
+    if isinstance(image, Image.Image):
+        image_np = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    else:
+        image_np = image
+    # 图像增强
+    enhanced = enhance_image(image_np)
+    # 执行 OCR
+    result = ocr.ocr(enhanced, cls=True)
+    if not result or not result[0]:
+        return []
+    return result[0]  # 第一页
 
 
-def extract_check_code(full_text):
+def process_file(file_path: str) -> list:
     """
-    提取校验码（通常 6 位数字或字母数字组合）
+    处理单个文件（图片或 PDF），返回每页的 OCR 结果列表
     """
-    match = re.search(r'(?:校验码|效验码)[：:\s]*([A-Za-z0-9]{6,8})', full_text)
-    if match:
-        return match.group(1)
-    # 尝试单独匹配 6 位数字（位于发票右上角附近，但 OCR 文本中可能独立出现）
-    # 为避免误匹配，只在前述正则失败时采用较宽松策略
-    match = re.search(r'(\d{6})\s*$', full_text.strip())
-    if match:
-        return match.group(1)
-    return ''
+    ext = os.path.splitext(file_path)[1].lower()
+    ocr_results_per_page = []
+
+    if ext in SUPPORTED_IMG_EXTS:
+        img = Image.open(file_path).convert("RGB")
+        ocr_res = recognize_image(img)
+        if ocr_res:
+            ocr_results_per_page.append(ocr_res)
+
+    else:
+        print(f"⚠️ 不支持的文件类型: {file_path}")
+    return ocr_results_per_page
 
 
-def process_images():
-    """
-    主处理函数：遍历文件夹 -> UIE-X 抽取 -> 补充正则 -> 保存 Excel
-    """
-    if not os.path.exists(IMAGE_FOLDER):
-        print(f"错误：图片文件夹不存在 -> {IMAGE_FOLDER}")
-        return
+# ==================== 主流程 ====================
+if __name__ == "__main__":
+    # 初始化 PaddleOCR（使用 PP-OCRv4 中文模型，自动下载）
+    print("正在加载 OCR 模型...")
+    ocr = PaddleOCR(
+        use_textline_orientation=True,       # 文字方向分类（新版参数）
+        lang="ch",
+        text_det_thresh=0.3,        # 检测阈值，调高可减少误检（新版参数）
+        text_det_box_thresh=0.5,    # 检测框阈值（新版参数）
+        text_recognition_batch_size=6, # 识别批量大小（新版参数）
+    )
+    print("模型加载完成。")
 
-    # 获取所有支持的文件
-    all_files = os.listdir(IMAGE_FOLDER)
-    image_files = [f for f in all_files if f.lower().endswith(SUPPORTED_EXT)]
-    if not image_files:
-        print(f"警告：在 {IMAGE_FOLDER} 中没有找到支持的图片/PDF文件")
-        return
+    # 遍历输入目录
+    all_records = []
+    if not os.path.exists(INPUT_DIR):
+        print(f"❌ 目录不存在: {INPUT_DIR}")
+        exit(1)
 
-    print(f"共发现 {len(image_files)} 个文件，开始处理...")
-    print("=" * 60)
+    files = [f for f in os.listdir(INPUT_DIR) if os.path.isfile(os.path.join(INPUT_DIR, f))]
+    if not files:
+        print("⚠️ 目录中没有可识别文件。")
+        exit(0)
 
-    # 初始化引擎（只需一次）
-    ie = init_uie_x()
-    ocr = init_ocr()  # 仅用于补充字段，也可不加，若不需要补充可注释
-
-    records = []
-    total = len(image_files)
-
-    for idx, filename in enumerate(image_files, 1):
-        filepath = os.path.join(IMAGE_FOLDER, filename)
-        print(f"[{idx}/{total}] 正在处理: {filename}")
-
+    for filename in files:
+        file_path = os.path.join(INPUT_DIR, filename)
+        print(f"正在处理: {filename}")
         try:
-            # 1. UIE-X 抽取主要字段
-            uiex_result = extract_with_uiex(ie, filepath)
-
-            # 2. 获取 OCR 全文（用于补充正则）
-            full_text, _ = extract_full_text(ocr, filepath)
-
-            # 3. 解析并合并字段
-            fields = parse_uiex_result(uiex_result, full_text)
-            fields['文件名'] = filename
-
-            records.append(fields)
-
-            # 打印摘要
-            print(f"  -> 发票号码: {fields.get('发票号码', '')}, "
-                  f"价税合计: {fields.get('价税合计(小写)', '')}, "
-                  f"销售方: {fields.get('销售方名称', '')[:20]}")
-
+            pages_ocr = process_file(file_path)
         except Exception as e:
-            print(f"  -> 处理失败: {e}")
-            # 添加一条空记录，便于定位问题文件
-            records.append({
-                '文件名': filename,
-                '发票代码': '', '发票号码': '', '开票日期': '', '校验码': '',
-                '价税合计(小写)': '', '价税合计(大写)': '',
-                '购买方名称': '', '购买方税号': '', '销售方名称': '', '销售方税号': '',
-                '备注': f'处理异常: {str(e)}'
-            })
+            print(f"❌ 处理失败: {filename}, 错误: {e}")
+            continue
+
+        for i, ocr_result in enumerate(pages_ocr):
+            # 尝试发票抽取
+            fields = extract_invoice_fields(ocr_result)
+            record = {
+                "文件名": filename,
+                "页码": i+1,
+                "全文本": " ".join([line[1][0] for line in ocr_result])  # 保存全文
+            }
+            if fields:  # 是发票
+                record.update(fields)
+            else:
+                # 合同等其他文件只保留全文
+                record["备注"] = "非发票文件，请查看全文本"
+            all_records.append(record)
+
+    if not all_records:
+        print("未提取到任何信息。")
+        exit(0)
+
+    # 转换为 DataFrame 并导出 Excel
+    df = pd.DataFrame(all_records)
+    # 重新排列列顺序：发票字段在前，全文在后
+    invoice_columns = [
+        "文件名", "页码",
+        "发票号码", "发票代码", "开票日期", "校验码",
+        "购买方名称", "购买方识别号",
+        "销售方名称", "销售方识别号",
+        "合计金额", "合计税额", "价税合计",
+        "备注", "全文本"
+    ]
+    # 仅保留实际存在的列
+    existing_columns = [col for col in invoice_columns if col in df.columns]
+    df = df[existing_columns]
 
     # 保存 Excel
-    if records:
-        df = pd.DataFrame(records)
-        # 定义列顺序
-        columns_order = [
-            '文件名', '发票代码', '发票号码', '开票日期', '校验码',
-            '价税合计(小写)', '价税合计(大写)',
-            '购买方名称', '购买方税号',
-            '销售方名称', '销售方税号'
-        ]
-        # 可能存在额外列（如备注），一并保留
-        existing_cols = [c for c in columns_order if c in df.columns]
-        other_cols = [c for c in df.columns if c not in columns_order]
-        df = df[existing_cols + other_cols]
-
-        df.to_excel(OUTPUT_EXCEL, index=False, engine='openpyxl')
-        print("=" * 60)
-        print(f"✅ 处理完成！共处理 {len(records)} 个文件，结果保存至: {OUTPUT_EXCEL}")
-    else:
-        print("未生成任何有效记录。")
-
-
-if __name__ == "__main__":
-    process_images()
+    os.makedirs("output", exist_ok=True)
+    df.to_excel(OUTPUT_EXCEL, index=False, engine="openpyxl")
+    print(f"✅ 识别完成！结果已保存至 {OUTPUT_EXCEL}")
